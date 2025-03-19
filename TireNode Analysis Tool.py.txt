@@ -1,0 +1,85 @@
+# import arcpy (only necessary in IDE, not ArcGIS Pro)
+import arcpy
+
+# set working environment: GDB, Spatial Reference, overwrite permission
+workingDir = arcpy.GetParameterAsText(0)
+# workingDir = input("What is the file path to the working GDB? [Make sure there are no spaces] ")
+arcpy.env.workspace = f"{workingDir}"
+# print("Workspace has been set to", workingDir)
+# Spatial Reference code 2856 is: NAD 1983 HARN StatePlane Washington South FIPS 4602
+arcpy.env.outputCoordinateSystem = arcpy.SpatialReference(2856)
+arcpy.env.overwriteOutput = True
+# input("Caution: Overwriting of data has been enabled. Are you sure you want to continue [Hit Enter]?")
+
+# set project site prefix to feature classes created by script
+projectSite = arcpy.GetParameterAsText(1)
+# print("Project name has been set to", projectSite)
+
+# create object for Tire Node point feature class
+tireNodes = arcpy.GetParameterAsText(2)
+
+# insert if / else statement here to tell user could not find point
+# tnSpatRef = arcpy.Describe(tireNodes).spatialReference.name
+# print("Spatial reference of the tire node point feature class is ", tnSpatRef)
+
+# input(f"This script has accessed the {tireNodes} feature class. [Hit Enter]")
+
+# buffer and dissolve node points at 1.5m and 2m
+bufferOutA = f"{projectSite}_nodeBuffer_1_5m"
+bufferOutB = f"{projectSite}_nodeBuffer_2m"
+arcpy.Buffer_analysis(tireNodes, bufferOutA, "1.5 meters", dissolve_option="ALL")
+arcpy.Buffer_analysis(tireNodes, bufferOutB, "2 meters", dissolve_option="ALL")
+# input("Buffers complete. [Hit Enter]")
+
+# create "voids" polygon fc of reef bounds without the 1.5m dissolve
+reefBound = arcpy.GetParameterAsText(3)
+boundVoid = f"{projectSite}_bound_voids"
+arcpy.Erase_analysis(reefBound, bufferOutA, boundVoid)
+# input("Bound node Erase complete. [Hit Enter]")
+
+# find extents of voids polygon and use feature to clip DynamicSurface bathymetric raster
+boundDesc = arcpy.Describe(boundVoid)
+boundXMin = boundDesc.extent.XMin
+boundYMin = boundDesc.extent.YMin
+boundXMax = boundDesc.extent.XMax
+boundYMax = boundDesc.extent.YMax
+boundVoidExt = str(boundXMin) + " " + str(boundYMin) + " " + str(boundXMax) + " " + str(boundYMax)
+
+rawBathy = arcpy.GetParameterAsText(4)
+bathyClip = f"{projectSite}_bathy_clipped"
+arcpy.Clip_management(rawBathy, boundVoidExt, bathyClip, boundVoid, clipping_geometry="ClippingGeometry")
+# input('Bathy raster has been clipped to "bound_voids" layer. [Hit Enter]')
+
+# convert clipped raster to points
+rasPoint = f"{projectSite}_bathy_clip_point"
+arcpy.RasterToPoint_conversion(bathyClip, rasPoint)
+
+# select converted bathy points by location and export to create "donut" point feature around voids
+rasPointBuf = arcpy.SelectLayerByLocation_management(rasPoint, "INTERSECT", bufferOutB)
+bathyBufPoint = f"{projectSite}_bathy_point_buffer"
+arcpy.CopyFeatures_management(rasPointBuf, bathyBufPoint)
+# input("Bathymetric buffer points created. Run Kriging? [Hit Enter]")
+
+# set raster processing environments
+
+arcpy.env.cellSize = bathyClip
+arcpy.env.snapRaster = bathyClip
+
+# Kriging interpolation on selected bathymetry points
+krigOut = f"{projectSite}_KrigingInterp"
+arcpy.Kriging_3d(bathyBufPoint, "grid_code", krigOut, "Exponential", "", "Fixed, 2, 24")
+
+# fill clipped bathymetry voids with Kriging interpolated values
+bathyNull = arcpy.sa.IsNull(bathyClip)
+bathyInterpRaw = arcpy.sa.Con(bathyNull, krigOut, bathyClip)
+bathyInterp = f"{projectSite}_DEM_wKrigingInterp"
+arcpy.Clip_management(bathyInterpRaw, boundVoidExt, bathyInterp, reefBound, clipping_geometry="ClippingGeometry")
+
+# subtract interpolated DEM from raw Dynamic Surface
+bathySub = f"{projectSite}_DynamicSurface_subtracted"
+arcpy.Minus_3d(rawBathy, bathyInterp, bathySub)
+
+# run Surface Volume on subtracted DSM
+arcpy.SurfaceVolume_3d(bathySub, f"{projectSite}_volumeOut.txt", "ABOVE", "0", "1")
+
+# print("Script complete")
